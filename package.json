@@ -1,0 +1,19 @@
+{
+  "name": "youtube-monetization-checker",
+  "version": "1.0.0",
+  "description": "Detect YouTube channel monetization status using multi-signal scraping (no official API needed)",
+  "main": "index.js",
+  "bin": {
+    "yt-monetized": "./index.js"
+  },
+  "scripts": {
+    "test": "node test.js",
+    "check": "node index.js"
+  },
+  "keywords": ["youtube", "monetization", "scraping", "ypp"],
+  "license": "MIT",
+  "dependencies": {},
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
