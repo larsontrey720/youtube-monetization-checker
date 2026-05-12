@@ -732,31 +732,53 @@ async function fetchChannelPage(channelUrl, verbose = false) {
 function computeVerdict(signals) {
   let confidence = 0;
 
-  // Ads detected = strongest positive signal
-  if (signals.adsDetected === true) confidence += WEIGHTS.adsOnVideo;
-  else if (signals.adsDetected === false && signals.videosChecked > 0) confidence += 0;
-  // If adsDetected is null (couldn't check), we don't penalise
-
-  // Join button = strong positive
-  if (signals.joinButton === true) confidence += WEIGHTS.joinButton;
-
-  // Subscriber count ≥ 1000 = necessary but not sufficient
-  if (signals.subscriberCount !== null) {
-    if (signals.subscriberCount >= 1000) confidence += WEIGHTS.subscriberCount;
-    else if (signals.subscriberCount < 500) confidence -= 10; // negative signal
+  // Ads detected = strongest positive signal (+50)
+  // Ads explicitly checked but none found = strong negative signal (-30)
+  // Ads not checked at all (null) = no contribution either way
+  if (signals.adsDetected === true) {
+    confidence += WEIGHTS.adsOnVideo;
+  } else if (signals.adsDetected === false && signals.videosChecked > 0) {
+    // We checked real videos and found zero ads — meaningful negative evidence.
+    // Weight scales with how many videos were checked (more checks = more confident).
+    const penalty = Math.min(30, signals.videosChecked * 10);
+    confidence -= penalty;
   }
 
-  // Members content
+  // Join button = strong positive (+25)
+  if (signals.joinButton === true) confidence += WEIGHTS.joinButton;
+
+  // Subscriber count: ≥1000 is necessary for YPP but not sufficient (+15)
+  // <500 is a hard disqualifier (-15)
+  if (signals.subscriberCount !== null) {
+    if (signals.subscriberCount >= 1000) confidence += WEIGHTS.subscriberCount;
+    else if (signals.subscriberCount < 500) confidence -= 15;
+  }
+
+  // Members-only content visible = monetization confirmed (+10)
   if (signals.membersContent === true) confidence += WEIGHTS.memberContent;
 
   confidence = Math.max(0, Math.min(100, confidence));
 
   let verdict;
-  if (confidence >= 70) verdict = 'MONETIZED';
-  else if (confidence >= 45) verdict = 'LIKELY_MONETIZED';
-  else if (confidence >= 20) verdict = 'UNLIKELY';
-  else if (signals.subscriberCount !== null && signals.subscriberCount < 500) verdict = 'NOT_MONETIZED';
-  else verdict = 'UNKNOWN';
+  if (confidence >= 70) {
+    verdict = 'MONETIZED';
+  } else if (confidence >= 45) {
+    verdict = 'LIKELY_MONETIZED';
+  } else if (confidence >= 20) {
+    verdict = 'UNLIKELY';
+  } else if (
+    signals.adsDetected === false &&
+    signals.videosChecked > 0 &&
+    signals.joinButton === false &&
+    signals.membersContent === false
+  ) {
+    // Explicitly checked for ads + found nothing + no membership signals = strong NOT_MONETIZED
+    verdict = 'NOT_MONETIZED';
+  } else if (signals.subscriberCount !== null && signals.subscriberCount < 500) {
+    verdict = 'NOT_MONETIZED';
+  } else {
+    verdict = 'UNKNOWN';
+  }
 
   return { confidence, verdict };
 }

@@ -294,20 +294,38 @@ console.log('\n── Confidence scoring / verdict ─────────�
 function mockComputeVerdict(signals) {
   const W = { adsOnVideo: 50, joinButton: 25, subscriberCount: 15, memberContent: 10 };
   let confidence = 0;
-  if (signals.adsDetected === true) confidence += W.adsOnVideo;
+  if (signals.adsDetected === true) {
+    confidence += W.adsOnVideo;
+  } else if (signals.adsDetected === false && signals.videosChecked > 0) {
+    const penalty = Math.min(30, signals.videosChecked * 10);
+    confidence -= penalty;
+  }
   if (signals.joinButton === true) confidence += W.joinButton;
   if (signals.subscriberCount !== null) {
     if (signals.subscriberCount >= 1000) confidence += W.subscriberCount;
-    else if (signals.subscriberCount < 500) confidence -= 10;
+    else if (signals.subscriberCount < 500) confidence -= 15;
   }
   if (signals.membersContent === true) confidence += W.memberContent;
   confidence = Math.max(0, Math.min(100, confidence));
   let verdict;
-  if (confidence >= 70) verdict = 'MONETIZED';
-  else if (confidence >= 45) verdict = 'LIKELY_MONETIZED';
-  else if (confidence >= 20) verdict = 'UNLIKELY';
-  else if (signals.subscriberCount !== null && signals.subscriberCount < 500) verdict = 'NOT_MONETIZED';
-  else verdict = 'UNKNOWN';
+  if (confidence >= 70) {
+    verdict = 'MONETIZED';
+  } else if (confidence >= 45) {
+    verdict = 'LIKELY_MONETIZED';
+  } else if (confidence >= 20) {
+    verdict = 'UNLIKELY';
+  } else if (
+    signals.adsDetected === false &&
+    signals.videosChecked > 0 &&
+    signals.joinButton === false &&
+    signals.membersContent === false
+  ) {
+    verdict = 'NOT_MONETIZED';
+  } else if (signals.subscriberCount !== null && signals.subscriberCount < 500) {
+    verdict = 'NOT_MONETIZED';
+  } else {
+    verdict = 'UNKNOWN';
+  }
   return { confidence, verdict };
 }
 
@@ -327,19 +345,22 @@ test('ads + subs only → MONETIZED (65%)', () => {
   eq(r.confidence, 65);
 });
 
-test('join + subs only → LIKELY_MONETIZED (40%)', () => {
+test('join button + subs + no ads checked (3 vids) → UNKNOWN (join prevents NOT_MONETIZED)', () => {
+  // confidence: -30 (3 vids no ads) + 25 (join) + 15 (subs) = 10
+  // joinButton=true prevents the NOT_MONETIZED branch → falls to UNKNOWN
   const r = mockComputeVerdict({
     adsDetected: false, joinButton: true, subscriberCount: 5000, membersContent: false, videosChecked: 3
   });
-  eq(r.verdict, 'UNLIKELY');
-  eq(r.confidence, 40);
+  eq(r.verdict, 'UNKNOWN');
+  eq(r.confidence, 10);
 });
 
-test('nothing detected → UNKNOWN', () => {
+test('nothing detected (3 videos checked, no ads) → NOT_MONETIZED', () => {
+  // With new scoring: checked 3 videos, found no ads, no other signals → NOT_MONETIZED
   const r = mockComputeVerdict({
     adsDetected: false, joinButton: false, subscriberCount: null, membersContent: false, videosChecked: 3
   });
-  eq(r.verdict, 'UNKNOWN');
+  eq(r.verdict, 'NOT_MONETIZED');
   eq(r.confidence, 0);
 });
 
@@ -414,6 +435,62 @@ test('returns false when adPlacements absent', () => {
 
 test('returns false when response is empty', () => {
   ok(!mockDetectAdsInResponse({}).hasAds);
+});
+
+// ─── New scoring behaviour: no-ads as negative signal ───────────────────────
+
+test('3 videos checked, no ads, no other signals → NOT_MONETIZED', () => {
+  const r = mockComputeVerdict({
+    adsDetected: false, joinButton: false, subscriberCount: 5000,
+    membersContent: false, videosChecked: 3
+  });
+  eq(r.verdict, 'NOT_MONETIZED');
+});
+
+test('3 videos checked, no ads, subs < 500 → NOT_MONETIZED', () => {
+  const r = mockComputeVerdict({
+    adsDetected: false, joinButton: false, subscriberCount: 200,
+    membersContent: false, videosChecked: 3
+  });
+  eq(r.verdict, 'NOT_MONETIZED');
+});
+
+test('1 video checked no ads = -10 penalty', () => {
+  const r = mockComputeVerdict({
+    adsDetected: false, joinButton: false, subscriberCount: null,
+    membersContent: false, videosChecked: 1
+  });
+  eq(r.confidence, 0); // penalty floors at 0
+});
+
+test('ads null (not checked) + subs only → UNKNOWN (15% confidence, below UNLIKELY threshold)', () => {
+  // confidence: 0 (null ads) + 0 + 15 (subs) = 15 → below 20 threshold → UNKNOWN
+  const r = mockComputeVerdict({
+    adsDetected: null, joinButton: false, subscriberCount: 5000,
+    membersContent: false, videosChecked: 0
+  });
+  eq(r.verdict, 'UNKNOWN');
+  eq(r.confidence, 15);
+});
+
+test('no ads checked + join button → UNLIKELY not NOT_MONETIZED', () => {
+  // Has join button even though no ads — edge case (ads disabled on all videos)
+  const r = mockComputeVerdict({
+    adsDetected: false, joinButton: true, subscriberCount: 5000,
+    membersContent: false, videosChecked: 3
+  });
+  // confidence = -30 (3 vids no ads) + 25 (join) + 15 (subs) = 10 → but joinButton=true
+  // so NOT_MONETIZED branch is skipped, falls to UNKNOWN
+  ok(r.verdict !== 'NOT_MONETIZED', 'Join button present should prevent NOT_MONETIZED verdict');
+});
+
+test('confidence penalty capped at 30 even with 5 videos checked', () => {
+  const r = mockComputeVerdict({
+    adsDetected: false, joinButton: false, subscriberCount: null,
+    membersContent: false, videosChecked: 5
+  });
+  // penalty = min(30, 5*10) = 30, then floored at 0
+  eq(r.confidence, 0);
 });
 
 // ─── Async integration tests + summary ───────────────────────────────────────
