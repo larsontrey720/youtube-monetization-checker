@@ -86,9 +86,10 @@ const INNERTUBE_HEADERS = {
   'X-Youtube-Client-Version': INNERTUBE_CLIENT_VERSION,
 };
 
-// Confidence weights (must sum to 100)
+// Confidence weights
 const WEIGHTS = {
-  adsOnVideo: 50,      // Actual ads detected in player response (strongest signal)
+  ytAd: 55,            // "yt_ad" token on watch page = YPP eligible (strongest signal)
+  adsOnVideo: 45,      // Actual adPlacements in InnerTube player response
   joinButton: 25,      // Join/membership button present
   subscriberCount: 15, // ≥1,000 subscribers (YPP requirement)
   memberContent: 10,   // Members-only content visible
@@ -675,6 +676,45 @@ async function checkVideoForAds(videoId, timeoutMs = 15000) {
   return { hasAds: false, adTypes: [], error: errors.join(' | '), client: null };
 }
 
+// ─── Video Watch Page Scraper (yt_ad signal) ────────────────────────────────
+
+/**
+ * Signal 3: Fetch the actual video watch page and check for "yt_ad" token.
+ *
+ * Unlike adPlacements in the InnerTube /player API (which only appears when ads
+ * are actively enabled on that specific video), "yt_ad" is embedded in the watch
+ * page HTML whenever the channel is in YPP — even if the creator has disabled
+ * ads on individual videos. This is the key signal that distinguishes
+ * "monetized but ads turned off" from "not monetized at all."
+ *
+ * @param {string} videoId
+ * @param {boolean} verbose
+ * @param {number} timeoutMs
+ * @returns {Promise<{ ytAdFound: boolean, error: string|null }>}
+ */
+async function checkVideoPageForYtAd(videoId, verbose = false, timeoutMs = 15000) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  try {
+    const { statusCode, body } = await httpGet(url, {}, timeoutMs);
+
+    if (statusCode !== 200) {
+      return { ytAdFound: false, error: `Watch page HTTP ${statusCode}` };
+    }
+
+    // "yt_ad" appears in the page source when the channel has ad monetization enabled
+    // even if no ads are currently scheduled on this video
+    const ytAdFound = body.includes('"yt_ad"') || body.includes('yt_ad:') || /[,{]yt_ad[,}]/.test(body);
+
+    if (verbose) {
+      console.error(`[yt_ad] Video ${videoId}: yt_ad=${ytAdFound} (page length ${body.length})`);
+    }
+
+    return { ytAdFound, error: null };
+  } catch (err) {
+    return { ytAdFound: false, error: err.message };
+  }
+}
+
 // ─── Channel Page Scraper ─────────────────────────────────────────────────────
 
 /**
@@ -732,15 +772,23 @@ async function fetchChannelPage(channelUrl, verbose = false) {
 function computeVerdict(signals) {
   let confidence = 0;
 
-  // Ads detected = strongest positive signal (+50)
-  // Ads explicitly checked but none found = strong negative signal (-30)
-  // Ads not checked at all (null) = no contribution either way
+  // yt_ad token on watch page = strongest positive signal (+55)
+  // YouTube only embeds this for YPP-enrolled channels, regardless of per-video ad settings.
+  // This fires even when creators have disabled ads on individual videos.
+  if (signals.ytAdFound === true) {
+    confidence += WEIGHTS.ytAd;
+  } else if (signals.ytAdFound === false && signals.ytAdVideoId) {
+    // We checked the watch page and found no yt_ad — strong negative signal
+    confidence -= 20;
+  }
+
+  // adPlacements in InnerTube player = ads actively running (+45)
+  // No adPlacements after checking multiple videos = negative signal
   if (signals.adsDetected === true) {
     confidence += WEIGHTS.adsOnVideo;
   } else if (signals.adsDetected === false && signals.videosChecked > 0) {
-    // We checked real videos and found zero ads — meaningful negative evidence.
-    // Weight scales with how many videos were checked (more checks = more confident).
-    const penalty = Math.min(30, signals.videosChecked * 10);
+    // Penalty scales with videos checked, but softer now since yt_ad is the primary signal
+    const penalty = Math.min(20, signals.videosChecked * 7);
     confidence -= penalty;
   }
 
@@ -767,12 +815,13 @@ function computeVerdict(signals) {
   } else if (confidence >= 20) {
     verdict = 'UNLIKELY';
   } else if (
+    signals.ytAdFound === false &&
     signals.adsDetected === false &&
     signals.videosChecked > 0 &&
     signals.joinButton === false &&
     signals.membersContent === false
   ) {
-    // Explicitly checked for ads + found nothing + no membership signals = strong NOT_MONETIZED
+    // Both watch page and player API checked — found nothing = NOT_MONETIZED
     verdict = 'NOT_MONETIZED';
   } else if (signals.subscriberCount !== null && signals.subscriberCount < 500) {
     verdict = 'NOT_MONETIZED';
@@ -819,6 +868,8 @@ async function checkMonetization(channelInput, options = {}) {
       adTypes: [],
       videosChecked: 0,
       videoResults: [],
+      ytAdFound: null,       // "yt_ad" token present on watch page = YPP eligible
+      ytAdVideoId: null,     // which video was used for yt_ad check
       membersContent: null,
       subscriberCount: null,
       subscriberRaw: null,
@@ -919,6 +970,16 @@ async function checkMonetization(channelInput, options = {}) {
       // null if ALL checks errored (can't conclude)
       const allErrored = result.signals.videoResults.every((r) => r.error && !r.hasAds);
       result.signals.adsDetected = allErrored && !anyAds ? null : anyAds;
+
+      // ── Signal: yt_ad token on watch page ─────────────────────────────────
+      // Check the first available video's watch page for the "yt_ad" token.
+      // This signal fires for YPP channels even when ads are disabled per-video.
+      const ytAdVideoId = videoIds[0];
+      const ytAdResult = await checkVideoPageForYtAd(ytAdVideoId, verbose, timeoutMs);
+      result.signals.ytAdFound = ytAdResult.ytAdFound;
+      result.signals.ytAdVideoId = ytAdVideoId;
+      if (ytAdResult.error) result.errors.push(`yt_ad check: ${ytAdResult.error}`);
+      if (verbose) console.error(`[signals] yt_ad token: ${ytAdResult.ytAdFound}`);
     }
   }
 
@@ -966,6 +1027,7 @@ function printResult(result) {
   console.log(` Confidence: ${result.confidence}%`);
   console.log('──────────────────────────────────────────────────');
   console.log(' Signals:');
+  console.log(`   yt_ad token     : ${result.signals.ytAdFound === null ? '— (not checked)' : result.signals.ytAdFound ? 'YES ← YPP enrolled' : 'NO'}`);
   console.log(`   Ads on videos   : ${result.signals.adsDetected === null ? '— (not checked)' : result.signals.adsDetected ? `YES (${result.signals.videoResults.filter(v=>v.hasAds).length}/${result.signals.videosChecked} videos)` : `NO (${result.signals.videosChecked} videos checked)`}`);
   console.log(`   Join button     : ${result.signals.joinButton === null ? '—' : result.signals.joinButton ? 'YES' : 'NO'}`);
   console.log(`   Members content : ${result.signals.membersContent === null ? '—' : result.signals.membersContent ? 'YES' : 'NO'}`);

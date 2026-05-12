@@ -292,12 +292,17 @@ test('returns null when no subscriber data', () => {
 console.log('\n── Confidence scoring / verdict ────────────────────');
 
 function mockComputeVerdict(signals) {
-  const W = { adsOnVideo: 50, joinButton: 25, subscriberCount: 15, memberContent: 10 };
+  const W = { ytAd: 55, adsOnVideo: 45, joinButton: 25, subscriberCount: 15, memberContent: 10 };
   let confidence = 0;
+  if (signals.ytAdFound === true) {
+    confidence += W.ytAd;
+  } else if (signals.ytAdFound === false && signals.ytAdVideoId) {
+    confidence -= 20;
+  }
   if (signals.adsDetected === true) {
     confidence += W.adsOnVideo;
   } else if (signals.adsDetected === false && signals.videosChecked > 0) {
-    const penalty = Math.min(30, signals.videosChecked * 10);
+    const penalty = Math.min(20, signals.videosChecked * 7);
     confidence -= penalty;
   }
   if (signals.joinButton === true) confidence += W.joinButton;
@@ -315,6 +320,7 @@ function mockComputeVerdict(signals) {
   } else if (confidence >= 20) {
     verdict = 'UNLIKELY';
   } else if (
+    signals.ytAdFound === false &&
     signals.adsDetected === false &&
     signals.videosChecked > 0 &&
     signals.joinButton === false &&
@@ -329,38 +335,43 @@ function mockComputeVerdict(signals) {
   return { confidence, verdict };
 }
 
-test('all signals positive → MONETIZED (100%)', () => {
+test('all signals positive (ytAd=null) → MONETIZED (95%)', () => {
+  // ytAd null = not checked; ads(45)+join(25)+subs(15)+members(10) = 95
   const r = mockComputeVerdict({
+    ytAdFound: null, ytAdVideoId: null,
     adsDetected: true, joinButton: true, subscriberCount: 1000000, membersContent: true, videosChecked: 3
   });
   eq(r.verdict, 'MONETIZED');
-  eq(r.confidence, 100);
+  eq(r.confidence, 95);
 });
 
-test('ads + subs only → MONETIZED (65%)', () => {
+test('ads + subs only (ytAd=null) → LIKELY_MONETIZED (60%)', () => {
+  // ads(45) + subs(15) = 60 → LIKELY_MONETIZED
   const r = mockComputeVerdict({
+    ytAdFound: null, ytAdVideoId: null,
     adsDetected: true, joinButton: false, subscriberCount: 5000, membersContent: false, videosChecked: 3
   });
   eq(r.verdict, 'LIKELY_MONETIZED');
-  eq(r.confidence, 65);
+  eq(r.confidence, 60);
 });
 
-test('join button + subs + no ads checked (3 vids) → UNKNOWN (join prevents NOT_MONETIZED)', () => {
-  // confidence: -30 (3 vids no ads) + 25 (join) + 15 (subs) = 10
-  // joinButton=true prevents the NOT_MONETIZED branch → falls to UNKNOWN
+test('join button + subs + no ads (ytAd=null, 3 vids) → UNLIKELY (20%)', () => {
+  // -(3*7=21, cap 20) + join(25) + subs(15) = 20 → UNLIKELY
   const r = mockComputeVerdict({
+    ytAdFound: null, ytAdVideoId: null,
     adsDetected: false, joinButton: true, subscriberCount: 5000, membersContent: false, videosChecked: 3
   });
-  eq(r.verdict, 'UNKNOWN');
-  eq(r.confidence, 10);
+  eq(r.verdict, 'UNLIKELY');
+  eq(r.confidence, 20);
 });
 
-test('nothing detected (3 videos checked, no ads) → NOT_MONETIZED', () => {
-  // With new scoring: checked 3 videos, found no ads, no other signals → NOT_MONETIZED
+test('nothing detected, ytAd=null (watch page not checked) → UNKNOWN', () => {
+  // ytAd null means NOT_MONETIZED branch requires ytAdFound=false explicitly
   const r = mockComputeVerdict({
+    ytAdFound: null, ytAdVideoId: null,
     adsDetected: false, joinButton: false, subscriberCount: null, membersContent: false, videosChecked: 3
   });
-  eq(r.verdict, 'NOT_MONETIZED');
+  eq(r.verdict, 'UNKNOWN');
   eq(r.confidence, 0);
 });
 
@@ -379,11 +390,14 @@ test('ads null (not checked) + join button → UNLIKELY', () => {
   eq(r.confidence, 40);
 });
 
-test('all signals positive → confidence capped at 100', () => {
+test('all signals positive including ytAd → confidence capped at 100', () => {
+  // ytAd(55) + ads(45) + join(25) + subs(15) + members(10) = 150 → capped at 100
   const r = mockComputeVerdict({
+    ytAdFound: true, ytAdVideoId: 'abc12345678',
     adsDetected: true, joinButton: true, subscriberCount: 9999999, membersContent: true, videosChecked: 5
   });
   eq(r.confidence, 100);
+  eq(r.verdict, 'MONETIZED');
 });
 
 console.log('\n── Ad detection from player response ───────────────');
@@ -439,8 +453,10 @@ test('returns false when response is empty', () => {
 
 // ─── New scoring behaviour: no-ads as negative signal ───────────────────────
 
-test('3 videos checked, no ads, no other signals → NOT_MONETIZED', () => {
+test('3 videos checked, no ads, ytAd=false → NOT_MONETIZED', () => {
+  // ytAd explicitly false + no ads + no other signals = NOT_MONETIZED
   const r = mockComputeVerdict({
+    ytAdFound: false, ytAdVideoId: 'abc12345678',
     adsDetected: false, joinButton: false, subscriberCount: 5000,
     membersContent: false, videosChecked: 3
   });
@@ -491,6 +507,60 @@ test('confidence penalty capped at 30 even with 5 videos checked', () => {
   });
   // penalty = min(30, 5*10) = 30, then floored at 0
   eq(r.confidence, 0);
+});
+
+// ─── yt_ad signal tests ─────────────────────────────────────────────────────
+
+test('yt_ad found = MONETIZED (55% from yt_ad alone)', () => {
+  const r = mockComputeVerdict({
+    ytAdFound: true, ytAdVideoId: 'abc12345678',
+    adsDetected: false, videosChecked: 3,
+    joinButton: false, subscriberCount: 5000, membersContent: false,
+  });
+  // ytAd(+55) - noAds(3*7=21, cap 20) + subs(+15) = 50 → LIKELY_MONETIZED
+  eq(r.verdict, 'LIKELY_MONETIZED');
+});
+
+test('yt_ad found + ads found = MONETIZED (high confidence)', () => {
+  const r = mockComputeVerdict({
+    ytAdFound: true, ytAdVideoId: 'abc12345678',
+    adsDetected: true, videosChecked: 3,
+    joinButton: false, subscriberCount: 5000, membersContent: false,
+  });
+  // ytAd(+55) + ads(+45) + subs(+15) = 115 → capped at 100
+  eq(r.verdict, 'MONETIZED');
+  eq(r.confidence, 100);
+});
+
+test('yt_ad found + ads disabled per-video = LIKELY_MONETIZED (not NOT_MONETIZED)', () => {
+  // This is the "monetized but ads turned off" case the old code got wrong
+  const r = mockComputeVerdict({
+    ytAdFound: true, ytAdVideoId: 'abc12345678',
+    adsDetected: false, videosChecked: 3,
+    joinButton: false, subscriberCount: 5000, membersContent: false,
+  });
+  ok(r.verdict !== 'NOT_MONETIZED', 'yt_ad present should prevent NOT_MONETIZED');
+  ok(r.verdict !== 'UNKNOWN', 'yt_ad present should give a confident verdict');
+});
+
+test('yt_ad not found + no other signals = NOT_MONETIZED', () => {
+  const r = mockComputeVerdict({
+    ytAdFound: false, ytAdVideoId: 'abc12345678',
+    adsDetected: false, videosChecked: 3,
+    joinButton: false, subscriberCount: 5000, membersContent: false,
+  });
+  eq(r.verdict, 'NOT_MONETIZED');
+});
+
+test('yt_ad null (watch page not checked) falls back to other signals', () => {
+  const r = mockComputeVerdict({
+    ytAdFound: null, ytAdVideoId: null,
+    adsDetected: true, videosChecked: 2,
+    joinButton: false, subscriberCount: 5000, membersContent: false,
+  });
+  // Only ads(+45) + subs(+15) = 60 → LIKELY_MONETIZED
+  eq(r.verdict, 'LIKELY_MONETIZED');
+  eq(r.confidence, 60);
 });
 
 // ─── Async integration tests + summary ───────────────────────────────────────
