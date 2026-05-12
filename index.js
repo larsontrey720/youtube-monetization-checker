@@ -66,6 +66,10 @@ const BROWSER_HEADERS = {
   'Sec-Fetch-Site': 'none',
   'Sec-Fetch-User': '?1',
   'Upgrade-Insecure-Requests': '1',
+  // Consent bypass: pre-accepts cookies so YouTube doesn't redirect to consent gate.
+  // SOCS=CAI is the minimal token that bypasses the EU/UK GDPR consent wall.
+  // Without this, server/VM IPs get a 302 -> consent.youtube.com -> 400 cycle.
+  'Cookie': 'SOCS=CAI; CONSENT=YES+cb; VISITOR_INFO1_LIVE=; PREF=tz=Europe.London&f6=40000000',
 };
 
 const INNERTUBE_HEADERS = {
@@ -100,7 +104,9 @@ const WEIGHTS = {
  * @param {number} timeoutMs
  * @returns {Promise<{statusCode: number, body: string, headers: object}>}
  */
-function httpGet(url, extraHeaders = {}, timeoutMs = 15000) {
+function httpGet(url, extraHeaders = {}, timeoutMs = 15000, _redirects = 0) {
+  if (_redirects > 5) return Promise.reject(new Error('Too many redirects: ' + url));
+
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const options = {
@@ -112,6 +118,18 @@ function httpGet(url, extraHeaders = {}, timeoutMs = 15000) {
     };
 
     const req = https.request(options, (res) => {
+      // Follow redirects (301/302/303/307/308) automatically
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        // Drain the response body so the socket is freed
+        res.resume();
+        let location = res.headers.location;
+        // Resolve relative redirects
+        if (!location.startsWith('http')) {
+          location = `https://${parsed.hostname}${location}`;
+        }
+        return resolve(httpGet(location, extraHeaders, timeoutMs, _redirects + 1));
+      }
+
       const encoding = res.headers['content-encoding'] || '';
       let stream = res;
 
@@ -579,16 +597,14 @@ async function fetchChannelPage(channelUrl, verbose = false) {
 
   if (verbose) console.error(`[fetch] GET ${videosUrl}`);
 
-  const { statusCode, body, headers } = await httpGet(videosUrl);
+  // httpGet follows redirects automatically (handles consent.youtube.com 302s)
+  const { statusCode, body } = await httpGet(videosUrl);
 
   if (verbose) console.error(`[fetch] Status: ${statusCode}, length: ${body.length}`);
 
-  if (statusCode === 301 || statusCode === 302 || statusCode === 307) {
-    const location = headers['location'];
-    if (location) {
-      if (verbose) console.error(`[fetch] Redirecting to: ${location}`);
-      return fetchChannelPage(location, verbose);
-    }
+  // Detect consent gate: YouTube returns 200 but with a consent page body
+  if (body.includes('consent.youtube.com') || body.includes('Before you continue to YouTube')) {
+    throw new Error('YouTube consent gate not bypassed — SOCS cookie may be stale');
   }
 
   if (statusCode !== 200) {
@@ -596,6 +612,12 @@ async function fetchChannelPage(channelUrl, verbose = false) {
   }
 
   const data = extractYtInitialData(body);
+
+  if (!data && verbose) {
+    console.error('[fetch] WARNING: ytInitialData not found in page. First 500 chars:');
+    console.error(body.slice(0, 500));
+  }
+
   return { html: body, data, finalUrl: videosUrl };
 }
 
