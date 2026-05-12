@@ -472,38 +472,53 @@ function detectMembersContent(html, data) {
 }
 
 /**
- * Extract recent video IDs from ytInitialData (Videos tab).
- * Returns up to `limit` video IDs that are likely > 4 minutes (we'll filter
- * by duration from the data if available, otherwise just take the first few).
- * @param {object} data  ytInitialData
+ * Extract recent video IDs from the raw page HTML.
+ *
+ * Uses a regex on the raw HTML string rather than walking parsed ytInitialData.
+ * This is renderer-agnostic and handles all YouTube layout variants:
+ *   - videoRenderer        (standard layout)
+ *   - richItemRenderer     (most channels since 2022)
+ *   - gridVideoRenderer    (older layout)
+ *   - reelItemRenderer     (Shorts)
+ *   - shortsLockupViewModel (new Shorts layout)
+ *
+ * Falls back to deepFind on ytInitialData if raw extraction yields nothing.
+ *
+ * @param {string} rawHtml  Raw page HTML string
+ * @param {object|null} data  ytInitialData (fallback)
  * @param {number} limit
  * @returns {string[]}
  */
-function extractVideoIds(data, limit = 5) {
-  const ids = [];
+function extractVideoIds(rawHtml, data, limit = 10) {
   const seen = new Set();
+  const ids = [];
 
-  // videoRenderer objects contain videoId
-  const videoRenderers = deepFind(data, 'videoRenderer');
-  for (const v of videoRenderers) {
-    if (!v?.videoId || seen.has(v.videoId)) continue;
-    seen.add(v.videoId);
-
-    // Try to get duration and prefer longer videos (more likely to have mid-rolls)
-    const lengthText =
-      v?.lengthText?.simpleText ||
-      v?.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText ||
-      '';
-
-    const durationSecs = parseDurationText(lengthText);
-    ids.push({ id: v.videoId, duration: durationSecs, title: v?.title?.runs?.[0]?.text || '' });
-    if (ids.length >= limit * 3) break; // Grab extra so we can sort
+  // Primary: regex scan of raw HTML — works across all renderer types.
+  // YouTube video IDs are exactly 11 chars from [a-zA-Z0-9_-].
+  const idMatches = (rawHtml || '').matchAll(/"videoId":"([a-zA-Z0-9_-]{11})"/g);
+  for (const m of idMatches) {
+    const id = m[1];
+    // Channel IDs start with UC — skip them
+    if (!seen.has(id) && !id.startsWith('UC')) {
+      seen.add(id);
+      ids.push(id);
+    }
   }
 
-  // Sort by duration descending, prefer longer videos for ad detection
-  ids.sort((a, b) => b.duration - a.duration);
+  // Fallback: deepFind on ytInitialData if raw extraction missed everything
+  if (ids.length === 0 && data) {
+    for (const key of ['videoRenderer', 'gridVideoRenderer', 'reelItemRenderer']) {
+      const renderers = deepFind(data, key);
+      for (const v of renderers) {
+        if (v?.videoId && !seen.has(v.videoId) && !v.videoId.startsWith('UC')) {
+          seen.add(v.videoId);
+          ids.push(v.videoId);
+        }
+      }
+    }
+  }
 
-  return ids.slice(0, limit).map((v) => v.id);
+  return ids.slice(0, limit);
 }
 
 /**
@@ -767,7 +782,7 @@ async function checkMonetization(channelInput, options = {}) {
     if (verbose) console.error(`[signals] Members content: ${membersResult.found} — ${membersResult.details}`);
 
     // ── Step 3: Extract video IDs for ad checking ───────────────────────────
-    const videoIds = extractVideoIds(pageData, videoSamples);
+    const videoIds = extractVideoIds(html, pageData, videoSamples);
     if (verbose) console.error(`[signals] Found ${videoIds.length} video IDs to check: ${videoIds.join(', ')}`);
 
     if (videoIds.length === 0) {
