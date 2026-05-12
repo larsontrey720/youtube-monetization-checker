@@ -536,66 +536,143 @@ function parseDurationText(text) {
 
 /**
  * Signal 2: Call InnerTube /player for a video and check for adPlacements.
+ * Tries multiple client contexts in order — some videos are LOGIN_REQUIRED
+ * on the WEB client but return fine on TVHTML5 or IOS (no auth needed).
  * @param {string} videoId
- * @returns {Promise<{ hasAds: boolean, adTypes: string[], error: string|null }>}
+ * @param {number} timeoutMs
+ * @returns {Promise<{ hasAds: boolean, adTypes: string[], error: string|null, client: string|null }>}
  */
-async function checkVideoForAds(videoId) {
-  const body = {
-    videoId,
-    context: {
-      client: {
-        clientName: 'WEB',
-        clientVersion: INNERTUBE_CLIENT_VERSION,
-        hl: 'en',
-        gl: 'US',
-        deviceMake: '',
-        deviceModel: '',
-        userAgent:
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36,gzip(gfe)',
-        browserName: 'Chrome',
-        browserVersion: '124.0.0.0',
-        osName: 'Windows',
-        osVersion: '10.0',
-        platform: 'DESKTOP',
-        utcOffsetMinutes: 0,
-        visitorData: '',
+async function checkVideoForAds(videoId, timeoutMs = 15000) {
+  // Client contexts to try in order.
+  // TVHTML5 and IOS don't require authentication for public videos and
+  // bypass the LOGIN_REQUIRED gate that WEB hits on some channels.
+  // ANDROID is included as a third fallback.
+  const clients = [
+    {
+      name: 'TVHTML5',
+      body: {
+        videoId,
+        context: {
+          client: {
+            clientName: 'TVHTML5',
+            clientVersion: '7.20240101.08.01',
+            hl: 'en',
+            gl: 'US',
+            utcOffsetMinutes: 0,
+          },
+        },
+        racyCheckOk: true,
+        contentCheckOk: true,
       },
     },
-    playbackContext: {
-      contentPlaybackContext: {
-        signatureTimestamp: 19950, // approximate; doesn't need to be exact for ad detection
+    {
+      name: 'IOS',
+      body: {
+        videoId,
+        context: {
+          client: {
+            clientName: 'IOS',
+            clientVersion: '19.09.3',
+            deviceMake: 'Apple',
+            deviceModel: 'iPhone16,2',
+            userAgent: 'com.google.ios.youtube/19.09.3 (iPhone; CPU iPhone OS 17_4 like Mac OS X)',
+            osName: 'iPhone',
+            osVersion: '17.4.0.21E219',
+            hl: 'en',
+            gl: 'US',
+            utcOffsetMinutes: 0,
+          },
+        },
+        racyCheckOk: true,
+        contentCheckOk: true,
       },
     },
-    racyCheckOk: false,
-    contentCheckOk: false,
-  };
+    {
+      name: 'WEB',
+      body: {
+        videoId,
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion: '2.20240101.09.00',
+            hl: 'en',
+            gl: 'US',
+            userAgent:
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36,gzip(gfe)',
+            browserName: 'Chrome',
+            browserVersion: '124.0.0.0',
+            osName: 'Windows',
+            osVersion: '10.0',
+            platform: 'DESKTOP',
+            utcOffsetMinutes: 0,
+          },
+        },
+        playbackContext: {
+          contentPlaybackContext: { signatureTimestamp: 19950 },
+        },
+        racyCheckOk: true,
+        contentCheckOk: true,
+      },
+    },
+    {
+      name: 'ANDROID',
+      body: {
+        videoId,
+        context: {
+          client: {
+            clientName: 'ANDROID',
+            clientVersion: '18.11.34',
+            androidSdkVersion: 30,
+            userAgent: 'com.google.android.youtube/18.11.34(Linux; U; Android 11) gzip',
+            hl: 'en',
+            gl: 'US',
+            utcOffsetMinutes: 0,
+          },
+        },
+        racyCheckOk: true,
+        contentCheckOk: true,
+      },
+    },
+  ];
 
-  try {
-    const response = await innertubePost('/youtubei/v1/player', body);
+  const errors = [];
 
-    if (!response || typeof response !== 'object') {
-      return { hasAds: false, adTypes: [], error: 'Empty response' };
+  for (const client of clients) {
+    try {
+      const response = await innertubePost('/youtubei/v1/player', client.body, timeoutMs);
+
+      if (!response || typeof response !== 'object') {
+        errors.push(`${client.name}: empty response`);
+        continue;
+      }
+
+      const status = response?.playabilityStatus?.status;
+
+      // Skip unplayable / login-required / private — try next client
+      if (status && !['OK', 'CONTENT_CHECK_REQUIRED'].includes(status)) {
+        errors.push(`${client.name}: ${status}`);
+        continue;
+      }
+
+      // Got a playable response — check for ads
+      if (Array.isArray(response.adPlacements) && response.adPlacements.length > 0) {
+        const adTypes = response.adPlacements
+          .map((p) => p?.adPlacementConfig?.kind || 'UNKNOWN')
+          .filter(Boolean);
+        return { hasAds: true, adTypes, error: null, client: client.name };
+      }
+
+      // Playable but no ads — this is a valid "no ads" result
+      return { hasAds: false, adTypes: [], error: null, client: client.name };
+
+    } catch (err) {
+      errors.push(`${client.name}: ${err.message}`);
     }
-
-    // Primary signal: adPlacements array
-    if (Array.isArray(response.adPlacements) && response.adPlacements.length > 0) {
-      const adTypes = response.adPlacements
-        .map((p) => p?.adPlacementConfig?.kind || 'UNKNOWN')
-        .filter(Boolean);
-      return { hasAds: true, adTypes, error: null };
-    }
-
-    // Secondary: check if response is blocked / age-restricted / private
-    const status = response?.playabilityStatus?.status;
-    if (status && status !== 'OK') {
-      return { hasAds: false, adTypes: [], error: `Video not playable: ${status}` };
-    }
-
-    return { hasAds: false, adTypes: [], error: null };
-  } catch (err) {
-    return { hasAds: false, adTypes: [], error: err.message };
   }
+
+  // All clients failed
+  return { hasAds: false, adTypes: [], error: errors.join(' | '), client: null };
 }
 
 // ─── Channel Page Scraper ─────────────────────────────────────────────────────
@@ -801,11 +878,11 @@ async function checkMonetization(channelInput, options = {}) {
         if (check.status === 'fulfilled') {
           const { hasAds, adTypes, error } = check.value;
           result.signals.videosChecked++;
-          result.signals.videoResults.push({ videoId, hasAds, adTypes, error });
+          result.signals.videoResults.push({ videoId, hasAds, adTypes, error, client: check.value.client });
 
           if (verbose) {
             console.error(
-              `[ads] Video ${videoId}: hasAds=${hasAds} types=[${adTypes.join(',')}] ${error ? `err=${error}` : ''}`
+              `[ads] Video ${videoId} (client=${check.value.client}): hasAds=${hasAds} types=[${adTypes.join(',')}] ${error ? `err=${error}` : ''}`
             );
           }
 
@@ -876,7 +953,8 @@ function printResult(result) {
     console.log('');
     console.log(' Video ad check results:');
     for (const v of result.signals.videoResults) {
-      const status = v.error && !v.hasAds ? `⚠️  error: ${v.error}` : v.hasAds ? `✅ ads: [${v.adTypes.join(', ')}]` : '❌ no ads';
+      const clientTag = v.client ? ` [${v.client}]` : '';
+      const status = v.error && !v.hasAds ? `⚠️  error: ${v.error}` : v.hasAds ? `✅ ads: [${v.adTypes.join(', ')}]${clientTag}` : `❌ no ads${clientTag}`;
       console.log(`   ${v.videoId}  ${status}`);
     }
   }
